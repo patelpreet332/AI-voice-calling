@@ -1,0 +1,40 @@
+{
+  "name": "ai-voice-agent_2",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "voice": "next dev",
+    "dev": "tsx server.ts",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.6",
+    "alawmulaw": "^6.0.0",
+    "axios": "^1.16.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "form-data": "^4.0.5",
+    "framer-motion": "^12.38.0",
+    "next": "16.2.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "twilio": "^4.10.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.1",
+    "autoprefixer": "^10.5.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.4",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^4.2.4",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}
