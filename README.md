@@ -32,6 +32,12 @@ cd python-stt
 pip install -r requirements.txt
 ```
 
+For the new local terminal test flow, install the helper packages here:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Environment Setup
 
 Create a `.env` file in the root directory:
@@ -67,6 +73,33 @@ Server runs on port 3000.
 ```bash
 python python-stt/main.py
 ```
+
+### Local Terminal Voice Agent Test
+
+For a live, end-to-end voice agent simulation in the terminal:
+
+1. Start the Python STT service:
+
+   ```bash
+   cd python-stt
+   python main.py
+   ```
+
+2. Start the Node.js local agent WebSocket server:
+
+   ```bash
+   node local_agent.js
+   ```
+
+3. In another terminal, run the client:
+   ```bash
+   cd python-stt
+   python local_test.py --duration 5
+   ```
+
+This will record your speech, send it to the agent via WebSocket, transcribe with local Whisper, query Groq LLM, generate TTS with Piper, and play the response audio.
+
+The script requires `GROQ_API_KEY` to be set in the project root `.env` or your shell environment.
 
 ## How It Works
 

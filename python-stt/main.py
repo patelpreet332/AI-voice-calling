@@ -1,8 +1,8 @@
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, UploadFile, HTTPException
-import shutil
-import uuid
-import os
+import numpy as np
+import soundfile as sf
+import io
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -10,9 +10,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Optimized 3-Language STT")
 
-# Load model once
+# Load model once — "small" is fast and sufficient for phone audio
 model = WhisperModel(
-    "medium",           # or "medium" / "small.en" if mostly English
+    "small",           
     device="cpu",
     compute_type="int8"
 )
@@ -22,20 +22,23 @@ ALLOWED_LANGS = {"en", "hi", "gu"}
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
-    file_id = str(uuid.uuid4())
-    input_path = f"temp_{file_id}.wav"
-
     try:
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Read file directly into memory — no disk I/O
+        file_bytes = await file.read()
+        audio_stream = io.BytesIO(file_bytes)
 
+        # Read WAV from memory into numpy array
+        # Note: 'soundfile' reads the WAV container in memory
+        audio_data, sample_rate = sf.read(audio_stream, dtype="float32")
+
+        # faster-whisper accepts numpy arrays directly
         segments, info = model.transcribe(
-            input_path,
-            language="hi",           # auto detection
+            audio_data,
+            language="en",           
             beam_size=1,
             best_of=1,
-            temperature=0.0,         # more deterministic
-            vad_filter=True,         # highly recommended
+            temperature=0.0,         
+            vad_filter=True,         
             vad_parameters=dict(
                 min_silence_duration_ms=500,
                 threshold=0.5
@@ -53,14 +56,9 @@ async def transcribe(file: UploadFile):
         # === Language Correction Logic ===
         final_lang = detected_lang
         if detected_lang not in ALLOWED_LANGS:
-            if confidence < 0.75:                     # low confidence
-                # Fallback to most probable among your 3 languages
-                # You can also run a second pass with each language and pick the best
+            if confidence < 0.75:                     
                 final_lang = "hi" if "hi" in text or any(ord(c) > 127 for c in text) else "en"
                 logger.warning(f"Unknown language {detected_lang} → fallback to {final_lang}")
-            else:
-                # High confidence but wrong language? Rare, but keep original
-                pass
 
         return {
             "text": text,
@@ -71,8 +69,5 @@ async def transcribe(file: UploadFile):
         }
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error during transcription: {e}")
         raise HTTPException(500, detail=str(e))
-    finally:
-        if os.path.exists(input_path):
-            os.remove(input_path)
