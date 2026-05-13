@@ -88,7 +88,7 @@ For a live, end-to-end voice agent simulation in the terminal:
 2. Start the Node.js local agent WebSocket server:
 
    ```bash
-   node local_agent.js
+   npx tsx local_agent.js
    ```
 
 3. In another terminal, run the client:

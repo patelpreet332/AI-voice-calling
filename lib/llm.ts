@@ -18,7 +18,8 @@ Conversation style:
 - Slightly vary phrasing to feel natural and unscripted.
 
 Language handling:
-- Always reply in the english language.
+- Always reply in the language in which the user is speaking.
+- CRITICAL MULTILINGUAL TTS SUPPORT: Our voice synthesis engine natively speaks English (Latin script) and Hindi (Devanagari script). Therefore, if you are responding in an Indian regional language (such as Gujarati, Bengali, Punjabi, Telugu, Tamil, Kannada, Malayalam, Marathi, etc.), you MUST write your response using the Devanagari script (transliterated phonetically) so that the voice engine can pronounce it perfectly. For example, write Gujarati or regional words using Devanagari script. If the user speaks in Hindi or Marathi, use native Devanagari script. If the user speaks in English, use English.
 
 Understanding user input:
 - Speech-to-text may contain errors; infer meaning from context.
@@ -66,11 +67,19 @@ export class LLMSession {
       this.history = [system, ...this.history.slice(-20)];
     }
 
+    // Embed invisible per-turn language directive to guarantee flawless multilingual behavior
+    const apiMessages = [...this.history];
+    const lastIdx = apiMessages.length - 1;
+    apiMessages[lastIdx] = {
+      role: "user",
+      content: `${userMessage}\n\n[System directive: Respond in language '${detectedLanguage}'. If this is an Indian regional language (e.g. gu, te, ta, kn, ml, bn, pa), you MUST output the response written entirely in the Devanagari script so the TTS engine can speak it.]`
+    };
+
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
         model: this.model,
-        messages: this.history,
+        messages: apiMessages,
         temperature: 0.75,
         max_tokens: 280,
         stream: true,

@@ -12,16 +12,14 @@ export async function synthesize(text: string, language: string = "en"): Promise
       PYTHON_TTS_API_URL,
       { 
         text,
-        language : 'en'
+        language
       },
       { 
         responseType: "arraybuffer" 
       }
     );
     
-    const pcmBuffer = Buffer.from(response.data);
-    console.log(`🔊 [TTS] Generated ${pcmBuffer.length} bytes (${language})`);
-    return pcmBuffer;
+    return Buffer.from(response.data);
   } catch (error: any) {
     console.error(`❌ TTS Error for language ${language}:`, error.message);
     throw new Error(`Failed to synthesize TTS: ${error.message}`);

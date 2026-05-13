@@ -1,6 +1,6 @@
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, UploadFile, HTTPException
-import numpy as np
+import uvicorn
 import soundfile as sf
 import io
 import logging
@@ -8,123 +8,208 @@ import os
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from piper.voice import PiperVoice
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Multi-Language STT & TTS")
+app = FastAPI(title="Multi-Language STT & TTS (Improved)")
 
-# ========================== MODELS ==========================
+# ========================== CONFIG ==========================
+ALLOWED_LANGS = {"en", "hi", "gu", "te", "ta", "kn", "ml", "bn", "pa", "mr", "ur", "or", "as"}
+
+# ========================== WHISPER ==========================
 model = WhisperModel(
-    "small",           # Better for Hindi than "small"
+    "medium",   # change to large-v3 if GPU available
     device="cpu",
     compute_type="int8"
 )
 
-# Allowed languages
-ALLOWED_LANGS = {"en", "hi", "gu"}
-
-# ======================= PIPER TTS MODELS =======================
+# ======================= PIPER TTS ==========================
 PIPER_MODELS = {}
 
 def load_piper_model(model_path: str, name: str):
     try:
-        logger.info(f"Loading Piper model: {name} from {model_path}")
         voice = PiperVoice.load(model_path)
         PIPER_MODELS[name] = voice
-        logger.info(f"✅ {name} TTS loaded successfully")
+        logger.info(f"✅ Loaded TTS: {name}")
         return voice
     except Exception as e:
-        logger.error(f"❌ Failed to load {name}: {e}")
+        logger.warning(f"⚠️ Failed loading {name}: {e}")
         return None
 
-# Load English and Hindi models
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "piper"))
 
 EN_MODEL_PATH = os.path.join(BASE_DIR, "en_US-lessac-medium.onnx")
-# HI_MODEL_PATH = os.path.join(BASE_DIR, "hi_IN-pratham-medium.onnx")   # Change filename if different
+HI_MODEL_PATH = os.path.join(BASE_DIR, "hi_IN-priyamvada-medium.onnx")
 
 piper_en = load_piper_model(EN_MODEL_PATH, "en")
-# piper_hi = load_piper_model(HI_MODEL_PATH, "hi")
+piper_hi = load_piper_model(HI_MODEL_PATH, "hi")
 
-# Fallback to English if Hindi not available
 DEFAULT_PIPER = piper_en
+
+# ======================= LANGUAGE HELPERS =======================
+
+def detect_script_language(text: str):
+    """Detect Indic language from Unicode ranges"""
+    for c in text:
+        code = ord(c)
+
+        if 0x0900 <= code <= 0x097F:
+            return "hi"
+        elif 0x0A80 <= code <= 0x0AFF:
+            return "gu"
+        elif 0x0B80 <= code <= 0x0BFF:
+            return "ta"
+        elif 0x0C00 <= code <= 0x0C7F:
+            return "te"
+        elif 0x0C80 <= code <= 0x0CFF:
+            return "kn"
+        elif 0x0D00 <= code <= 0x0D7F:
+            return "ml"
+        elif 0x0980 <= code <= 0x09FF:
+            return "bn"
+        elif 0x0A00 <= code <= 0x0A7F:
+            return "pa"
+    return None
+
+
+def resolve_language(detected_lang, confidence, text):
+    """
+    Combines Whisper detection + script fallback
+    """
+    if detected_lang in ALLOWED_LANGS and confidence >= 0.75:
+        return detected_lang
+
+    script_lang = detect_script_language(text)
+    if script_lang:
+        return script_lang
+
+    return "en"
+
+
+def convert_to_devanagari(text: str, lang: str):
+    """Transliterates regional Indic scripts deterministically into Devanagari script"""
+    mapping = {
+        "te": sanscript.TELUGU,
+        "ta": sanscript.TAMIL,
+        "kn": sanscript.KANNADA,
+        "ml": sanscript.MALAYALAM,
+        "bn": sanscript.BENGALI,
+        "gu": sanscript.GUJARATI,
+        "pa": sanscript.GURMUKHI,
+    }
+
+    if lang in mapping:
+        return transliterate(text, mapping[lang], sanscript.DEVANAGARI)
+
+    return text
+
+# ======================= TTS =======================
 
 class TTSRequest(BaseModel):
     text: str
-    language: str = "en"   # New: accept language
+    language: str = "en"
+
 
 @app.post("/tts")
 async def generate_tts(req: TTSRequest):
-    if not req.language:
-        req.language = "en"
-    
-    voice = PIPER_MODELS.get(req.language, DEFAULT_PIPER)
-    
-    if not voice:
-        logger.warning(f"Voice for '{req.language}' not loaded, using English fallback")
-        voice = DEFAULT_PIPER
+    if not req.text.strip():
+        raise HTTPException(400, "Text is empty")
 
-    def audio_stream():
-        for chunk in voice.synthesize(req.text):
+    text = req.text
+    lang = req.language or "en"
+
+    # Detect script override if regional characters are present
+    script_lang = detect_script_language(text)
+    if script_lang and script_lang != "hi":
+        lang = script_lang
+
+    # Transliteration Layer: Convert if not Hindi/English natively
+    if lang not in ["hi", "en"]:
+        try:
+            text = convert_to_devanagari(text, lang)
+            logger.info(f"✨ Transliterated ({lang} -> Devanagari): {text[:60]}")
+        except Exception as e:
+            logger.warning(f"⚠️ Transliteration failed: {e}")
+        lang = "hi"  # route natively to the Hindi Piper voice model
+
+    # Select voice
+    voice = PIPER_MODELS.get(lang)
+
+    # Smart fallback
+    if not voice:
+        if lang != "en" and "hi" in PIPER_MODELS:
+            voice = PIPER_MODELS["hi"]
+        else:
+            voice = DEFAULT_PIPER
+
+    def stream():
+        for chunk in voice.synthesize(text):
             yield chunk.audio_int16_bytes
 
-    return StreamingResponse(audio_stream(), media_type="audio/pcm")
+    return StreamingResponse(stream(), media_type="audio/pcm")
+
+# ======================= STT =======================
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
     try:
-        file_bytes = await file.read()
-        audio_stream = io.BytesIO(file_bytes)
+        audio_bytes = await file.read()
+        audio_stream = io.BytesIO(audio_bytes)
 
         audio_data, sample_rate = sf.read(audio_stream, dtype="float32")
 
-        # Better language detection for multilingual
         segments, info = model.transcribe(
             audio_data,
-            language="en",           # Auto detect
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
+            language=None,
+            beam_size=5,
+            temperature=[0.0, 0.2, 0.4],
+            repetition_penalty=1.2,
+            condition_on_previous_text=False,
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=400,
                 threshold=0.5
             ),
+            no_speech_threshold=0.6,
+            initial_prompt=None,  # removed bias
             word_timestamps=False
         )
 
         text = " ".join([seg.text.strip() for seg in segments]).strip()
 
-        detected_lang = info.language or "en"
+        detected_lang = info.language or "unknown"
         confidence = float(info.language_probability)
 
-        logger.info(f"Raw detected: {detected_lang} | Confidence: {confidence:.3f} | Text: {text[:80]}...")
+        final_lang = resolve_language(detected_lang, confidence, text)
+        script_lang = detect_script_language(text)
 
-        # === Improved Language Logic ===
-        final_lang = detected_lang
-
-        if detected_lang not in ALLOWED_LANGS:
-            if confidence < 0.70 or detected_lang == "unknown":
-                # Fallback logic
-                has_devanagari = any(ord(c) > 127 for c in text)
-                final_lang = "hi" if has_devanagari else "en"
-                logger.warning(f"Unknown lang {detected_lang} → fallback to {final_lang}")
-            else:
-                final_lang = "en"
-
-        # Force Hindi if strong Hindi indicators
-        if "hi" in text.lower() or any(ord(c) in range(0x0900, 0x097F) for c in text):
-            final_lang = "hi"
+        logger.info(
+            f"Detected={detected_lang} | Final={final_lang} | Conf={confidence:.2f} | Text={text[:60]}"
+        )
 
         return {
             "text": text,
             "language": final_lang,
             "confidence": round(confidence, 3),
-            "duration": round(info.duration, 2),
-            "raw_detected": detected_lang
+            "raw_detected": detected_lang,
+            "script_detected": script_lang,
+            "duration": round(info.duration, 2)
         }
 
     except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        raise HTTPException(500, detail=str(e))
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(500, str(e))
+
+# ======================= RUN =======================
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        access_log=False
+    )

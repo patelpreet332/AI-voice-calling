@@ -202,10 +202,7 @@ wss.on("connection", (twilioWs: WebSocket) => {
           break;
 
         case "mark":
-          console.log(
-            "✔️  [TWILIO] Mark received:",
-            message.mark?.name,
-          );
+          // Omit noisy internal transport mark logging during interaction
           break;
 
         case "stop":

@@ -32,7 +32,7 @@ export async function transcribe(pcmBuffer: Buffer): Promise<STTResult> {
 
   const response = await axios.post(`${STT_URL}/transcribe`, form, {
     headers: form.getHeaders(),
-    timeout: 30000,
+    timeout: 150000,
   });
 
   return {
