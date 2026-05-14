@@ -158,6 +158,19 @@ venv
 
 # Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+venv_source/
+**/venv*/
+python-stt/venv/
+venvsource/
+
+# Python
+__pycache__/
 *.py[cod]
 *$py.class
 *.so

@@ -1,112 +1,68 @@
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, UploadFile, HTTPException
-import uvicorn
-import soundfile as sf
-import io
-import logging
-import os
-from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import soundfile as sf
+import numpy as np
+import io
+import time
+import logging
+import torch
+import os
+
 from piper.voice import PiperVoice
-from indic_transliteration import sanscript
-from indic_transliteration.sanscript import transliterate
 
+# ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("HYBRID-STT")
 
-app = FastAPI(title="Multi-Language STT & TTS (Improved)")
+app = FastAPI(title="Dynamic STT + TTS (Whisper + IndicConformer)")
 
-# ========================== CONFIG ==========================
-ALLOWED_LANGS = {"en", "hi", "gu", "te", "ta", "kn", "ml", "bn", "pa", "mr", "ur", "or", "as"}
+# ==================== CONFIG ====================
+INDIC_LANGS = {"hi", "gu", "te", "ta", "kn", "ml", "pa"}
 
-# ========================== WHISPER ==========================
-model = WhisperModel(
-    "medium",   # change to large-v3 if GPU available
-    device="cpu",
-    compute_type="int8"
-)
+# ==================== MODELS ====================
 
-# ======================= PIPER TTS ==========================
+logger.info("🧠 Loading Whisper...")
+whisper = WhisperModel("small", device="cpu", compute_type="int8")
+logger.info("✅ Whisper loaded")
+
+indic_model = None
+
+def load_indic():
+    global indic_model
+    try:
+        from transformers import AutoModel
+        logger.info("🧠 Loading IndicConformer...")
+        indic_model = AutoModel.from_pretrained(
+            "ai4bharat/indic-conformer-600m-multilingual",
+            trust_remote_code=True
+        )
+        logger.info("✅ IndicConformer loaded")
+    except Exception as e:
+        logger.warning(f"⚠️ IndicConformer failed: {e}")
+
+load_indic()
+
+# ==================== TTS ====================
+
 PIPER_MODELS = {}
 
-def load_piper_model(model_path: str, name: str):
+def load_piper(path, name):
     try:
-        voice = PiperVoice.load(model_path)
+        voice = PiperVoice.load(path)
         PIPER_MODELS[name] = voice
         logger.info(f"✅ Loaded TTS: {name}")
-        return voice
     except Exception as e:
         logger.warning(f"⚠️ Failed loading {name}: {e}")
-        return None
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "piper"))
 
-EN_MODEL_PATH = os.path.join(BASE_DIR, "en_US-lessac-medium.onnx")
-HI_MODEL_PATH = os.path.join(BASE_DIR, "hi_IN-priyamvada-medium.onnx")
+load_piper(os.path.join(BASE_DIR, "en_US-lessac-medium.onnx"), "en")
+load_piper(os.path.join(BASE_DIR, "hi_IN-priyamvada-medium.onnx"), "hi")
 
-piper_en = load_piper_model(EN_MODEL_PATH, "en")
-piper_hi = load_piper_model(HI_MODEL_PATH, "hi")
+DEFAULT_TTS = PIPER_MODELS.get("en")
 
-DEFAULT_PIPER = piper_en
-
-# ======================= LANGUAGE HELPERS =======================
-
-def detect_script_language(text: str):
-    """Detect Indic language from Unicode ranges"""
-    for c in text:
-        code = ord(c)
-
-        if 0x0900 <= code <= 0x097F:
-            return "hi"
-        elif 0x0A80 <= code <= 0x0AFF:
-            return "gu"
-        elif 0x0B80 <= code <= 0x0BFF:
-            return "ta"
-        elif 0x0C00 <= code <= 0x0C7F:
-            return "te"
-        elif 0x0C80 <= code <= 0x0CFF:
-            return "kn"
-        elif 0x0D00 <= code <= 0x0D7F:
-            return "ml"
-        elif 0x0980 <= code <= 0x09FF:
-            return "bn"
-        elif 0x0A00 <= code <= 0x0A7F:
-            return "pa"
-    return None
-
-
-def resolve_language(detected_lang, confidence, text):
-    """
-    Combines Whisper detection + script fallback
-    """
-    if detected_lang in ALLOWED_LANGS and confidence >= 0.75:
-        return detected_lang
-
-    script_lang = detect_script_language(text)
-    if script_lang:
-        return script_lang
-
-    return "en"
-
-
-def convert_to_devanagari(text: str, lang: str):
-    """Transliterates regional Indic scripts deterministically into Devanagari script"""
-    mapping = {
-        "te": sanscript.TELUGU,
-        "ta": sanscript.TAMIL,
-        "kn": sanscript.KANNADA,
-        "ml": sanscript.MALAYALAM,
-        "bn": sanscript.BENGALI,
-        "gu": sanscript.GUJARATI,
-        "pa": sanscript.GURMUKHI,
-    }
-
-    if lang in mapping:
-        return transliterate(text, mapping[lang], sanscript.DEVANAGARI)
-
-    return text
-
-# ======================= TTS =======================
 
 class TTSRequest(BaseModel):
     text: str
@@ -114,98 +70,142 @@ class TTSRequest(BaseModel):
 
 
 @app.post("/tts")
-async def generate_tts(req: TTSRequest):
+async def tts(req: TTSRequest):
     if not req.text.strip():
-        raise HTTPException(400, "Text is empty")
+        raise HTTPException(400, "Empty text")
 
-    text = req.text
-    lang = req.language or "en"
-
-    # Detect script override if regional characters are present
-    script_lang = detect_script_language(text)
-    if script_lang and script_lang != "hi":
-        lang = script_lang
-
-    # Transliteration Layer: Convert if not Hindi/English natively
-    if lang not in ["hi", "en"]:
-        try:
-            text = convert_to_devanagari(text, lang)
-            logger.info(f"✨ Transliterated ({lang} -> Devanagari): {text[:60]}")
-        except Exception as e:
-            logger.warning(f"⚠️ Transliteration failed: {e}")
-        lang = "hi"  # route natively to the Hindi Piper voice model
-
-    # Select voice
-    voice = PIPER_MODELS.get(lang)
-
-    # Smart fallback
-    if not voice:
-        if lang != "en" and "hi" in PIPER_MODELS:
-            voice = PIPER_MODELS["hi"]
-        else:
-            voice = DEFAULT_PIPER
+    voice = PIPER_MODELS.get(req.language, DEFAULT_TTS)
 
     def stream():
-        for chunk in voice.synthesize(text):
+        for chunk in voice.synthesize(req.text):
             yield chunk.audio_int16_bytes
 
     return StreamingResponse(stream(), media_type="audio/pcm")
 
-# ======================= STT =======================
+
+# ==================== STT CORE ====================
+
+def detect_language(audio):
+    """
+    Whisper-based language detection
+    """
+    segments, info = whisper.transcribe(
+        audio,
+        language=None,
+        beam_size=1,
+        best_of=1
+    )
+
+    # trigger detection
+    for _ in segments:
+        break
+
+    lang = info.language or "en"
+    prob = float(info.language_probability)
+
+    logger.info(f"🌐 [WHISPER DETECT] → {lang} ({prob:.2%})")
+
+    return lang, prob
+
+
+def transcribe_whisper(audio, lang=None):
+    segments, info = whisper.transcribe(audio, language=lang)
+
+    text = " ".join([s.text.strip() for s in segments]).strip()
+
+    return {
+        "text": text,
+        "language": info.language or lang or "en",
+        "engine": "whisper"
+    }
+
+
+def transcribe_indic(audio, lang):
+    if indic_model is None:
+        logger.warning("⚠️ IndicConformer unavailable → fallback to Whisper")
+        return transcribe_whisper(audio, lang)
+
+    try:
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio).float()
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+
+        with torch.no_grad():
+            output = indic_model(audio, lang)
+
+        text = " ".join(output) if isinstance(output, list) else str(output)
+
+        return {
+            "text": text.strip(),
+            "language": lang,
+            "engine": "indic-conformer"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ IndicConformer failed: {e}")
+        return transcribe_whisper(audio, lang)
+
+
+# ==================== STT API ====================
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
     try:
         audio_bytes = await file.read()
-        audio_stream = io.BytesIO(audio_bytes)
+        audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
 
-        audio_data, sample_rate = sf.read(audio_stream, dtype="float32")
+        # Convert to mono
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
 
-        segments, info = model.transcribe(
-            audio_data,
-            language=None,
-            beam_size=5,
-            temperature=[0.0, 0.2, 0.4],
-            repetition_penalty=1.2,
-            condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=400,
-                threshold=0.5
-            ),
-            no_speech_threshold=0.6,
-            initial_prompt=None,  # removed bias
-            word_timestamps=False
-        )
+        start = time.time()
 
-        text = " ".join([seg.text.strip() for seg in segments]).strip()
+        # STEP 1: Detect language
+        lang, prob = detect_language(audio)
 
-        detected_lang = info.language or "unknown"
-        confidence = float(info.language_probability)
+        # STEP 2: Route
+        if lang in INDIC_LANGS:
+            logger.info(f"🇮🇳 [ROUTE] Indic → {lang}")
+            result = transcribe_indic(audio, lang)
+        else:
+            logger.info(f"🇬🇧 [ROUTE] Whisper → {lang}")
+            result = transcribe_whisper(audio, lang)
 
-        final_lang = resolve_language(detected_lang, confidence, text)
-        script_lang = detect_script_language(text)
+        result["detected_language"] = lang
+        result["confidence"] = round(prob, 3)
+        result["time"] = round(time.time() - start, 2)
 
         logger.info(
-            f"Detected={detected_lang} | Final={final_lang} | Conf={confidence:.2f} | Text={text[:60]}"
+            f"📊 Done | Lang={lang} | Engine={result['engine']} | Time={result['time']}s"
         )
 
-        return {
-            "text": text,
-            "language": final_lang,
-            "confidence": round(confidence, 3),
-            "raw_detected": detected_lang,
-            "script_detected": script_lang,
-            "duration": round(info.duration, 2)
-        }
+        return result
 
     except Exception as e:
-        logger.error(f"Transcription error: {e}")
+        logger.error(f"❌ Transcription error: {e}")
         raise HTTPException(500, str(e))
 
-# ======================= RUN =======================
+
+# ==================== HEALTH ====================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "models": {
+            "whisper": "loaded",
+            "indic_conformer": "loaded" if indic_model else "not_loaded"
+        },
+        "tts": list(PIPER_MODELS.keys())
+    }
+
+
+# ==================== RUN ====================
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

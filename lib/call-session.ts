@@ -132,7 +132,7 @@ export class CallSession {
         return;
       }
 
-      console.log(`👤 [USER] "${sttResult.text}" (${sttResult.language})`);
+      console.log(`👤 [USER] "${sttResult.text}" (${sttResult.language} | engine: ${sttResult.engine || 'unknown'} | detect: ${sttResult.detect_time || 0}s | total: ${sttResult.pipeline_time || 0}s)`);
 
       // === INTERRUPTION COMMANDS ===
       const lower = sttResult.text.toLowerCase().trim();
