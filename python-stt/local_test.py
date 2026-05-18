@@ -1,595 +1,362 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════╗
-║  LOCAL VOICE AGENT — End-to-End Terminal Test               ║
-║                                                             ║
-║  Pipeline:                                                  ║
-║  🎤 Mic → VAD → Whisper (lang detect)                      ║
-║       → English?  → Whisper (transcribe)                    ║
-║       → Indian?   → IndicConformer (transcribe)             ║
-║  → Groq LLM (streaming) → Piper TTS → 🔊 Speaker          ║
-╚══════════════════════════════════════════════════════════════╝
 
-Usage:
-    python local_test.py                 # Interactive voice loop
-    python local_test.py --file test.wav # Transcribe a file (no LLM/TTS)
-"""
-
-import os
-import sys
-import time
-import logging
+import os, sys, time, json, logging, threading, queue
 import numpy as np
 import sounddevice as sd
 import webrtcvad
 import requests
-import json
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ==================== PATHS & ENV ====================
+# ================= CONFIG =================
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
-
-env_path = PROJECT_ROOT / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    datefmt="%H:%M:%S"
-)
-logger = logging.getLogger("LOCAL-AGENT")
-
-# ==================== CONFIG ====================
+load_dotenv(PROJECT_ROOT / ".env")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-VAD_MODE = 3                # Most aggressive
-SILENCE_THRESHOLD = 1.5     # Seconds of silence = end of speech
-CHUNK_DURATION = 0.03       # 30ms chunks
 
-INDIC_LANGS = {"hi", "gu", "te", "ta", "kn", "ml", "pa", "mr"}
+VAD_MODE = 1
+CHUNK_DURATION = 0.03
+MIN_SPEECH_SEC = 0.8
+SILENCE_SEC = 1.0
+MAX_AUDIO_SEC = 20
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+INDIC_LANGS = {"hi", "gu", "te", "ta"}
+VALID_LANGS = {"en", "hi", "te", "ta", "gu"}
+
+FORCE_LANG = None
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-SYSTEM_PROMPT = """You are a friendly, natural Indian voice assistant in a real-time phone call.
+SYSTEM_PROMPT = """You are a real-time voice assistant speaking over a phone call.
+Keep replies natural, human-like and brief.
+Keep your response short and to the point, like a helpful friend on a call but should include all user answer.
+Always reply in same language as user.
+Use casual spoken tone.
+If unclear, ask short clarification.
+Never say you are an AI.
+"""
 
-Core rules:
-- Speak exactly like a helpful human friend — warm, casual, never robotic.
-- Keep every reply to short, simple and to the point.
-- Vary your phrasing naturally.
+# ================= LOGGING =================
 
-Language rules:
-- Always reply in the same language (or mix) the user is using right now.
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("VOICE")
 
-STT is sometimes imperfect — understand intent, not exact words.
-If unclear, ask one short clarification question.
+# ================= GLOBAL =================
 
-Never be verbose. Never use lists or markdown.
-If user says stop/bas/chup/enough — politely stop and confirm.
+audio_queue = queue.Queue()
+text_queue = queue.Queue()
+reply_queue = queue.Queue()
 
-Tone: Friendly, calm, helpful, slightly playful."""
+conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+conversation_lock = threading.Lock()
 
-# ==================== MODEL LOADING ====================
+session = requests.Session()
 
 whisper_model = None
 indic_model = None
 piper_voices = {}
 
-def load_all_models():
-    """Load Whisper, IndicConformer, and Piper TTS models."""
+# ================= LOAD =================
+def warmup():
+    log.info("[WARMUP] starting")
+
+    dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
+
+    # Whisper warmup
+    whisper_model.transcribe(dummy)
+
+    # Indic warmup
+    if indic_model:
+        import torch
+        indic_model(torch.zeros(1, SAMPLE_RATE), "hi")
+
+    # TTS warmup
+    if "en" in piper_voices:
+        for _ in piper_voices["en"].synthesize("hello"):
+            break
+
+    log.info("[WARMUP] done")
+
+def load_models():
     global whisper_model, indic_model, piper_voices
 
-    # ── Whisper (language detection + English transcription) ──
-    print("\n🧠 Loading Whisper small...")
-    start = time.time()
     from faster_whisper import WhisperModel
     whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-    print(f"✅ Whisper loaded ({time.time() - start:.1f}s)")
+    log.info("[INIT] Whisper ready")
 
-    # ── IndicConformer (Indian language transcription) ──
-    print("🧠 Loading IndicConformer-600M...")
-    start = time.time()
     try:
-        import torch
         from transformers import AutoModel
         indic_model = AutoModel.from_pretrained(
             "ai4bharat/indic-conformer-600m-multilingual",
             trust_remote_code=True
         )
-        print(f"✅ IndicConformer loaded ({time.time() - start:.1f}s)")
+        log.info("[INIT] Indic ready")
     except Exception as e:
-        print(f"⚠️  IndicConformer failed to load: {e}")
-        print("   Indian languages will fallback to Whisper")
+        log.error(f"[INIT] Indic failed: {e}")
         indic_model = None
 
-    # ── Piper TTS ──
-    print("🧠 Loading Piper TTS voices...")
-    try:
-        from piper.voice import PiperVoice
-        piper_dir = PROJECT_ROOT / "piper"
+    from piper.voice import PiperVoice
 
-        en_path = piper_dir / "en_US-lessac-medium.onnx"
-        hi_path = piper_dir / "hi_IN-priyamvada-medium.onnx"
+    voices = {
+        "en": "en_US-lessac-medium.onnx",
+        "hi": "hi_IN-priyamvada-medium.onnx",
+        "te": "te_IN-padmavathi-medium.onnx",
+        "gu": "gu_epoch229.onnx",
+    }
 
-        if en_path.exists():
-            piper_voices["en"] = PiperVoice.load(str(en_path))
-            print(f"✅ Piper EN loaded")
-        if hi_path.exists():
-            piper_voices["hi"] = PiperVoice.load(str(hi_path))
-            print(f"✅ Piper HI loaded")
+    for lang, file in voices.items():
+        path = PROJECT_ROOT / "piper" / file
+        if path.exists():
+            piper_voices[lang] = PiperVoice.load(str(path))
+            log.info(f"[TTS] Loaded {lang}")
 
-        if not piper_voices:
-            print("⚠️  No Piper voices found — TTS will be disabled")
-    except Exception as e:
-        print(f"⚠️  Piper TTS failed: {e}")
-
-
-# ==================== VAD (VOICE ACTIVITY DETECTION) ====================
+# ================= VAD =================
 
 vad = webrtcvad.Vad(VAD_MODE)
 
-def is_speech(frame: bytes) -> bool:
+def is_speech(frame):
     try:
         return vad.is_speech(frame, SAMPLE_RATE)
     except:
         return False
 
-def record_with_vad() -> np.ndarray:
-    """
-    Records audio from mic using WebRTC VAD.
-    Returns float32 numpy array at 16kHz (ready for Whisper/IndicConformer).
-    """
-    print("\n🎤 Listening... Speak now")
+def mic_worker():
+    while True:
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype='int16',
+            blocksize=int(SAMPLE_RATE * CHUNK_DURATION)
+        )
+        stream.start()
 
-    buffer = []
-    silence_frames = 0
-    recording = False
+        buffer = []
+        silence = 0
+        speech_frames = 0
 
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype='int16',
-        blocksize=int(SAMPLE_RATE * CHUNK_DURATION)
-    )
-    stream.start()
+        min_frames = int(MIN_SPEECH_SEC / CHUNK_DURATION)
+        silence_frames = int(SILENCE_SEC / CHUNK_DURATION)
 
-    try:
+        log.info("🎤 Listening...")
+
         while True:
-            audio_chunk, _ = stream.read(stream.blocksize)
-            frame = audio_chunk.tobytes()
+            chunk, _ = stream.read(stream.blocksize)
+            frame = chunk.tobytes()
 
             if is_speech(frame):
-                if not recording:
-                    print("🗣️  Speech detected...")
-                    recording = True
-                silence_frames = 0
-                buffer.extend(audio_chunk.flatten())
+                buffer.extend(chunk.flatten())
+                speech_frames += 1
+                silence = 0
             else:
-                if recording:
-                    silence_frames += 1
-                    buffer.extend(audio_chunk.flatten())
-
-                    if silence_frames > int(SILENCE_THRESHOLD / CHUNK_DURATION):
-                        print("⏹️  Speech ended")
+                if speech_frames > min_frames:
+                    silence += 1
+                    buffer.extend(chunk.flatten())
+                    if silence > silence_frames:
                         break
-    finally:
+                else:
+                    buffer = []
+                    speech_frames = 0
+
         stream.stop()
         stream.close()
 
-    if not buffer:
-        return np.array([], dtype=np.float32)
+        if not buffer:
+            continue
 
-    # Convert int16 → float32 for Whisper/IndicConformer
-    audio_int16 = np.array(buffer, dtype=np.int16)
-    audio_float32 = audio_int16.astype(np.float32) / 32768.0
-    duration = len(audio_float32) / SAMPLE_RATE
-    print(f"✅ Recorded {duration:.1f}s")
+        audio = np.array(buffer, dtype=np.int16).astype(np.float32) / 32768.0
 
-    return audio_float32
+        if len(audio) > SAMPLE_RATE * MAX_AUDIO_SEC:
+            audio = audio[:SAMPLE_RATE * MAX_AUDIO_SEC]
 
+        audio_queue.put(audio)
 
-# ==================== HYBRID STT ====================
+# ================= STT =================
 
-def detect_language(audio: np.ndarray) -> tuple:
-    """
-    Use Whisper to detect language from audio.
-    Returns (language_code, confidence).
-    """
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=None,
-        beam_size=1,
-        best_of=1,
-        temperature=0.0,
-        vad_filter=True,
-    )
+def stt_worker():
+    while True:
+        audio = audio_queue.get()
+        start = time.time()
 
-    # Must consume at least one segment to populate info
-    for _ in segments:
-        break
+        # ================= FORCE MODE =================
+        if FORCE_LANG:
+            lang = FORCE_LANG
 
-    lang = info.language or "en"
-    prob = float(info.language_probability)
-    return lang, prob
+            if lang in INDIC_LANGS and indic_model:
+                import torch
+                audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
+                with torch.no_grad():
+                    out = indic_model(audio_tensor, lang)
+                text = " ".join(out) if isinstance(out, list) else str(out)
+                engine = "indic"
 
+            else:
+                segments, _ = whisper_model.transcribe(
+                    audio,
+                    language=lang,
+                    beam_size=1,
+                    temperature=0.0
+                )
+                text = "".join(s.text for s in segments)
+                engine = "whisper"
 
-def transcribe_whisper(audio: np.ndarray, lang: str = None) -> dict:
-    """Transcribe using Whisper (for English or fallback)."""
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=lang,
-        beam_size=5,
-        temperature=0.0,
-        vad_filter=True,
-    )
+        # ================= AUTO MODE =================
+        else:
+            segments, info = whisper_model.transcribe(
+                audio,
+                beam_size=1,
+                temperature=0.0
+            )
 
-    text = " ".join([s.text.strip() for s in segments]).strip()
-    return {
-        "text": text,
-        "language": info.language or lang or "en",
-        "engine": "whisper"
-    }
+            lang = info.language or "en"
+            if lang not in VALID_LANGS:
+                lang = "hi"
 
+            if lang in INDIC_LANGS and indic_model:
+                import torch
+                audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
+                with torch.no_grad():
+                    out = indic_model(audio_tensor, lang)
+                text = " ".join(out) if isinstance(out, list) else str(out)
+                engine = "indic"
+            else:
+                text = "".join(s.text for s in segments)
+                engine = "whisper"
 
-def transcribe_indic(audio: np.ndarray, lang: str) -> dict:
-    """Transcribe using IndicConformer (for Indian languages)."""
-    import torch
+        text = text.strip()
 
-    if indic_model is None:
-        logger.warning("IndicConformer not loaded → falling back to Whisper")
-        return transcribe_whisper(audio, lang)
+        if not text or len(text) < 2:
+            continue
 
-    try:
-        audio_tensor = torch.from_numpy(audio).float()
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)  # [1, samples]
+        log.info(f"[USER] ({engine}/{lang}) {time.time()-start:.2f}s → {text}")
+        text_queue.put((text, lang))
 
-        with torch.no_grad():
-            output = indic_model(audio_tensor, lang)
+# ================= LLM =================
 
-        text = " ".join(output) if isinstance(output, list) else str(output)
+def llm_worker():
+    while True:
+        text, lang = text_queue.get()
+        start = time.time()
 
-        return {
-            "text": text.strip(),
-            "language": lang,
-            "engine": "indic-conformer"
-        }
-    except Exception as e:
-        logger.error(f"IndicConformer failed: {e}")
-        return transcribe_whisper(audio, lang)
+        user_input = f"{text}\n\n[Reply in {lang}, short spoken.]"
 
+        with conversation_lock:
+            conversation.append({"role": "user", "content": user_input})
+            conversation[:] = conversation[-10:]
 
-def hybrid_transcribe(audio: np.ndarray, forced_lang: str = None) -> dict:
-    """
-    Full hybrid pipeline:
-    - If forced_lang is set: skip detection, use that language directly
-    - Otherwise: Whisper detects language, then routes accordingly
-    """
-    t0 = time.time()
-
-    if forced_lang:
-        # Language forced by user — skip detection
-        lang = forced_lang
-        prob = 1.0
-        detect_time = 0.0
-        logger.info(f"🔒 Language forced: {lang} (skipping detection)")
-    else:
-        # Step 1: Auto-detect language with Whisper
-        lang, prob = detect_language(audio)
-        detect_time = time.time() - t0
-
-    # Step 2: Route to correct engine
-    if lang in INDIC_LANGS:
-        result = transcribe_indic(audio, lang)
-    else:
-        result = transcribe_whisper(audio, lang)
-
-    total_time = time.time() - t0
-
-    result["detected_lang"] = lang
-    result["confidence"] = round(prob, 3)
-    result["detect_time"] = round(detect_time, 2)
-    result["total_time"] = round(total_time, 2)
-
-    return result
-
-
-# ==================== LLM (GROQ) ====================
-
-conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-def chat_with_llm(user_text: str, language: str) -> str:
-    """
-    Send user text to Groq LLM and get streaming response.
-    Returns the full reply text.
-    """
-    global conversation_history
-
-    # Add hidden language directive
-    augmented_text = (
-        f"{user_text}\n\n"
-        f"[System directive: Respond in language '{language}'. "
-        f"If this is an Indian regional language (gu, te, ta, kn, ml, pa), "
-        f"write the response in Devanagari script so the TTS engine can speak it.]"
-    )
-
-    conversation_history.append({"role": "user", "content": augmented_text})
-
-    # Trim history (keep system + last 20 turns)
-    if len(conversation_history) > 21:
-        system = conversation_history[0]
-        conversation_history = [system] + conversation_history[-20:]
-
-    try:
-        response = requests.post(
+        res = session.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
                 "model": GROQ_MODEL,
-                "messages": conversation_history,
-                "temperature": 0.75,
-                "max_tokens": 280,
+                "messages": conversation,
+                "temperature": 0.6,
+                "max_tokens": 150,
                 "stream": True,
             },
             stream=True,
-            timeout=15,
         )
-        response.raise_for_status()
 
-        full_reply = ""
-        print("🤖 AI: ", end="", flush=True)
+        buffer = ""
+        full = ""
+        first_token = None
 
-        for line in response.iter_lines():
-            line = line.decode("utf-8").strip()
-            if not line or line == "data: [DONE]":
+        for line in res.iter_lines():
+            if not line:
                 continue
+
+            line = line.decode("utf-8")
+
             if line.startswith("data: "):
-                try:
-                    data = json.loads(line[6:])
-                    token = data["choices"][0]["delta"].get("content", "")
-                    if token:
-                        full_reply += token
-                        print(token, end="", flush=True)
-                except (json.JSONDecodeError, KeyError):
-                    pass
+                if "[DONE]" in line:
+                    break
 
-        print()  # newline after streaming
-        conversation_history.append({"role": "assistant", "content": full_reply})
-        return full_reply
+                data = json.loads(line[6:])
+                token = data["choices"][0]["delta"].get("content", "")
 
-    except Exception as e:
-        logger.error(f"LLM error: {e}")
-        return "Sorry, I couldn't process that."
+                if token:
+                    if first_token is None:
+                        first_token = time.time()
 
+                    buffer += token
+                    full += token
 
-# ==================== TTS (PIPER) ====================
+                    # STREAM TO TTS
+                    if len(buffer) > 60 or buffer.endswith((".", "?", "!")):
+                        reply_queue.put((buffer, lang, False))
+                        buffer = ""
 
-def speak(text: str, language: str = "en"):
-    """
-    Synthesize text with Piper TTS and play through speakers.
-    Routes: English → en voice, anything else → hi voice (Devanagari).
-    """
-    if not piper_voices:
-        print("⚠️  No TTS voices loaded — skipping playback")
-        return
+        if buffer:
+            reply_queue.put((buffer, lang, True))
 
-    # Choose voice: English uses EN, everything else uses HI
-    if language == "en":
-        voice = piper_voices.get("en", piper_voices.get("hi"))
-    else:
-        voice = piper_voices.get("hi", piper_voices.get("en"))
+        total = time.time() - start
+        first_latency = (first_token - start) if first_token else 0
 
-    if not voice:
-        print("⚠️  No suitable voice found")
-        return
+        log.info(f"[LLM] first={first_latency:.2f}s total={total:.2f}s")
+        log.info(f"[ASSISTANT] → {full}")
+        with conversation_lock:
+            conversation.append({"role": "assistant", "content": full})
 
-    try:
-        # Collect all audio chunks
-        audio_chunks = []
-        for chunk in voice.synthesize(text):
-            audio_chunks.append(chunk.audio_int16_bytes)
+# ================= TTS =================
 
-        if not audio_chunks:
-            return
+def tts_worker():
+    stream = sd.OutputStream(samplerate=22050, channels=1, dtype='int16')
+    stream.start()
 
-        audio_bytes = b"".join(audio_chunks)
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-
-        print("🔊 Speaking...")
-        # Piper outputs at 22050 Hz
-        sd.play(audio_np, samplerate=22050, blocking=True)
-        print("✅ Done speaking\n")
-
-    except Exception as e:
-        logger.error(f"TTS playback error: {e}")
-
-
-# ==================== FILE MODE ====================
-
-def test_file(filepath: str):
-    """Transcribe a single audio file (no LLM/TTS)."""
-    import soundfile as sf
-
-    path = Path(filepath)
-    if not path.exists():
-        print(f"❌ File not found: {filepath}")
-        return
-
-    print(f"\n📁 Processing: {path.name}")
-
-    audio, sr = sf.read(str(path), dtype="float32")
-
-    # Resample to 16kHz if needed
-    if sr != SAMPLE_RATE:
-        import torchaudio
-        import torch
-        audio_tensor = torch.from_numpy(audio).float()
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
-        resampler = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
-        audio_tensor = resampler(audio_tensor)
-        audio = audio_tensor.squeeze(0).numpy()
-
-    # Mono
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-
-    result = hybrid_transcribe(audio)
-
-    print("\n" + "=" * 60)
-    print("  TRANSCRIPTION RESULT")
-    print("=" * 60)
-    print(f"  📝 Text     : {result['text']}")
-    print(f"  🌐 Language : {result['language']} (detected: {result['detected_lang']}, conf: {result['confidence']:.1%})")
-    print(f"  ⚙️  Engine   : {result['engine']}")
-    print(f"  ⏱️  Time     : {result['total_time']}s (detect: {result['detect_time']}s)")
-    print("=" * 60 + "\n")
-
-
-# ==================== INTERACTIVE VOICE LOOP ====================
-
-def voice_loop(forced_lang: str = None):
-    """
-    Full end-to-end voice conversation loop:
-    Mic → VAD → Hybrid STT → Groq LLM → Piper TTS → Speaker
-    """
-    print("\n" + "=" * 60)
-    print("  🚀 LOCAL VOICE AGENT — Ready!")
-    if forced_lang:
-        print(f"  🔒 Language: {forced_lang} (forced, no auto-detect)")
-    else:
-        print("  🌐 Language: Auto-detect")
-    print("  Pipeline: Mic → Whisper/IndicConformer → Groq → Piper")
-    print("  Press Ctrl+C to exit")
-    print("=" * 60)
-
-    if not GROQ_API_KEY:
-        print("\n⚠️  GROQ_API_KEY not set! LLM will not work.")
-        print("   Set it in .env or export GROQ_API_KEY=...")
-
-    turn = 0
+    buffer = ""
+    current_lang = "en"
 
     while True:
-        try:
-            turn += 1
-            audio = record_with_vad()
+        text, lang, is_final = reply_queue.get()
 
-            # Skip very short audio (< 0.5s)
-            if len(audio) < SAMPLE_RATE * 0.5:
-                print("⚠️  Too short, ignoring...")
-                continue
+        current_lang = lang
+        buffer += text
 
-            # ── STT ──
-            print("📝 Transcribing...")
-            stt_start = time.time()
-            result = hybrid_transcribe(audio, forced_lang=forced_lang)
-            stt_time = time.time() - stt_start
+        # SMART FLUSH CONDITIONS
+        should_flush = (
+            len(buffer) > 80 or
+            buffer.endswith((".", "?", "!")) or
+            is_final
+        )
 
-            text = result["text"]
-            lang = result["language"]
-            engine = result["engine"]
+        if not should_flush:
+            continue
 
-            if not text.strip():
-                print("⚠️  Empty transcription, try again...")
-                continue
+        voice = piper_voices.get(current_lang[:2], piper_voices.get("hi"))
+        if not voice:
+            buffer = ""
+            continue
 
-            print(f"\n{'─' * 50}")
-            print(f"👤 You [{lang} | {engine} | {stt_time:.1f}s]: {text}")
-            print(f"{'─' * 50}")
+        log.info(f"[TTS] speaking chunk → {buffer}")
 
-            # ── Check for exit commands ──
-            lower = text.lower().strip()
-            if any(cmd in lower for cmd in ["quit", "exit", "bye", "goodbye", "band karo", "bye bye"]):
-                farewell = "Bye! Take care!" if lang == "en" else "अच्छा, बाय बाय! ख्याल रखना!"
-                print(f"🤖 AI: {farewell}")
-                speak(farewell, lang)
-                print("\n👋 Conversation ended.")
-                break
+        for chunk in voice.synthesize(buffer):
+            audio = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+            stream.write(audio)
 
-            # ── LLM ──
-            llm_start = time.time()
-            reply = chat_with_llm(text, lang)
-            llm_time = time.time() - llm_start
+        buffer = ""
 
-            if not reply.strip():
-                continue
-
-            print(f"   ⏱️  LLM: {llm_time:.1f}s")
-
-            # ── TTS ──
-            tts_start = time.time()
-            speak(reply, lang)
-            tts_time = time.time() - tts_start
-
-            # ── Pipeline summary ──
-            total = stt_time + llm_time + tts_time
-            print(f"   📊 Pipeline: STT={stt_time:.1f}s | LLM={llm_time:.1f}s | TTS={tts_time:.1f}s | Total={total:.1f}s")
-
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
-        except Exception as e:
-            logger.error(f"Error in voice loop: {e}")
-            time.sleep(0.5)
-
-
-# ==================== MAIN ====================
+# ================= MAIN =================
 
 def main():
-    import argparse
+    global FORCE_LANG
 
-    parser = argparse.ArgumentParser(
-        description="Local Voice Agent — Hybrid STT + LLM + TTS",
-        usage="%(prog)s [lang] [--file FILE]"
-    )
-    parser.add_argument(
-        "lang",
-        nargs="?",
-        default=None,
-        help="Force language (e.g. hi, gu, ta, en). Omit for auto-detect."
-    )
-    parser.add_argument(
-        "--file", "-f",
-        type=str,
-        default=None,
-        help="Audio file to transcribe (skips LLM/TTS)"
-    )
+    if len(sys.argv) > 1:
+        FORCE_LANG = sys.argv[1]
 
-    args = parser.parse_args()
+    load_models()
+    warmup()
 
-    forced_lang = args.lang
+    threading.Thread(target=mic_worker, daemon=True).start()
+    threading.Thread(target=stt_worker, daemon=True).start()
+    threading.Thread(target=llm_worker, daemon=True).start()
+    threading.Thread(target=tts_worker, daemon=True).start()
 
-    print("\n" + "═" * 60)
-    print("  🎙️  LOCAL VOICE AGENT")
-    if forced_lang:
-        print(f"  🔒 Language: {forced_lang} (forced)")
-        if forced_lang in INDIC_LANGS:
-            print(f"  ⚙️  Engine: IndicConformer (skipping Whisper detect)")
-        else:
-            print(f"  ⚙️  Engine: Whisper")
-    else:
-        print("  🌐 Language: Auto-detect (Whisper → route)")
-    print("  Groq LLM | Piper TTS")
-    print("═" * 60)
-
-    # Load all models
-    load_all_models()
-
-    if args.file:
-        # File mode — just transcribe, no conversation
-        test_file(args.file)
-    else:
-        # Interactive voice loop
-        voice_loop(forced_lang=forced_lang)
-
+    while True:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
