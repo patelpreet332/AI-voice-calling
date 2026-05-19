@@ -5,15 +5,10 @@ import { LLMSession } from "./llm.js";
 import { synthesize } from "./tts.js";
 import { mulawToLinear16k, pcmToMulawBase64 } from "./audio-utils.js";
 
-/** Size of each mulaw chunk sent back to Twilio */
 const TWILIO_CHUNK_SIZE = 160;
-/** Piper TTS output sample rate */
 const PIPER_SAMPLE_RATE = 22050;
 
-/** Optional greeting message (empty by default for lowest latency) */
 const GREETING_TEXT = (process.env.GREETING_TEXT || "").trim();
-// Don't bias language detection at call start. We only start hinting after we have
-// at least one detected language from the STT service.
 const DEFAULT_HINT_LANG = (process.env.DEFAULT_LANG || "").trim().toLowerCase().slice(0, 2);
 
 function envInt(name: string, fallback: number): number {
@@ -39,9 +34,7 @@ export class CallSession {
     this.streamSid = streamSid;
     this.twilioWs = twilioWs;
 
-    // VAD tuned to mirror python-stt/local_test.py semantics
     this.vad = new VAD({
-      // Allow per-deploy tuning for Twilio phone audio without code changes.
       speechThreshold: envInt("VAD_THRESHOLD", 300),
       silenceDurationMs: envInt("VAD_SILENCE_MS", 650),
       minSpeechDurationMs: envInt("VAD_MIN_SPEECH_MS", 650),
@@ -64,16 +57,14 @@ export class CallSession {
     this.callSid = callSid;
   }
 
-  /**
-   * Process incoming audio from Twilio
-   */
+
   processMedia(base64Payload: string): void {
     if (!this.isActive) return;
 
     const pcm16k = mulawToLinear16k(base64Payload);
     const now = Date.now();
 
-    // Cooldown period after AI finishes speaking (reduces echo)
+
     if (now - this.lastAiSpeechEndTime < 850) {
       return;
     }
@@ -81,12 +72,11 @@ export class CallSession {
     if (this.isAiSpeaking) {
       const rms = this.calculateRMS(pcm16k);
 
-      // Strong interruption threshold
+
       if (rms > 680) {
         console.log("⚡ [INTERRUPT] User interrupted AI!");
         this.interrupt();
       } else {
-        // Feed with higher threshold while AI is speaking
         this.vad.processAudioWithThreshold(pcm16k, 800);
         return;
       }
@@ -126,9 +116,7 @@ export class CallSession {
     }
   }
 
-  /**
-   * Handle complete user utterance
-   */
+
   private async handleUtterance(pcmAudio: Buffer): Promise<void> {
     if (!this.isActive) return;
 
@@ -143,7 +131,6 @@ export class CallSession {
         hintLanguage: this.lastDetectedLanguage || undefined,
       });
 
-      // Call might have ended while STT was running.
       if (!this.isActive || mySeq !== this.utteranceSeq) {
         return;
       }
@@ -159,7 +146,7 @@ export class CallSession {
         this.lastDetectedLanguage = sttResult.language.toLowerCase().slice(0, 2);
       }
 
-      // === INTERRUPTION COMMANDS ===
+
       const lower = sttResult.text.toLowerCase().trim();
       if (["stop", "shut up", "bas", "chup", "band kar", "enough", "quiet", "rok"].some(cmd => lower.includes(cmd))) {
         console.log("🛑 [STOP COMMAND] User asked to stop");
@@ -168,7 +155,7 @@ export class CallSession {
         return;
       }
 
-      // === LLM + TTS (streaming buffer similar to local_test.py) ===
+
       console.log("🤖 [LLM] Thinking...");
       const llmStart = Date.now();
       let firstChunkLogged = false;

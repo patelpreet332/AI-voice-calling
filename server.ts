@@ -8,21 +8,17 @@ import FormData from "form-data";
 import { mulaw } from "alawmulaw";
 import "dotenv/config";
 
-// ── Local AI pipeline imports ──
 import { CallSession } from "./lib/call-session.js";
 import { checkPiperReady } from "./lib/tts.js";
-
-// ── ElevenLabs import (preserved — not used for local pipeline) ──
 import { connectToElevenLabs } from "./lib/elevenlabs.js";
 
 const PORT = process.env.PORT || 3000;
 
 const app = express();
-const server = createServer(app); 
+const server = createServer(app);
 
 const wss = new WebSocketServer({ noServer: true });
 
-// ✅ Upgrade handler
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/media-stream") {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -44,9 +40,7 @@ const upload = multer();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ═══════════════════════════════════════════════════════
-// ✅ API Routes (preserved — existing functionality)
-// ═══════════════════════════════════════════════════════
+
 
 app.post("/api/ai", async (req: Request, res: Response) => {
   try {
@@ -135,9 +129,7 @@ app.post(
   },
 );
 
-// ═══════════════════════════════════════════════════════
-// ✅ Twilio webhook — outbound call connects here
-// ═══════════════════════════════════════════════════════
+
 
 app.post("/voice", (req: Request, res: Response) => {
   console.log("🔔 [TWILIO] Webhook hit");
@@ -156,10 +148,6 @@ app.post("/voice", (req: Request, res: Response) => {
   res.send(response.toString());
 });
 
-// ═══════════════════════════════════════════════════════
-// ✅ WebSocket handler — Local AI Pipeline
-//    Twilio mulaw 8kHz → PCM 16kHz → STT → LLM → TTS → mulaw 8kHz → Twilio
-// ═══════════════════════════════════════════════════════
 
 wss.on("connection", (twilioWs: WebSocket) => {
   let callSession: CallSession | null = null;
@@ -186,7 +174,7 @@ wss.on("connection", (twilioWs: WebSocket) => {
             message.start.mediaFormat?.channels,
           );
 
-          // Create a new CallSession for this call
+
           callSession = new CallSession(streamSid, twilioWs);
           if (message.start.callSid) {
             callSession.setCallSid(message.start.callSid);
@@ -197,7 +185,6 @@ wss.on("connection", (twilioWs: WebSocket) => {
           const payload = message.media?.payload;
           if (!payload || !callSession) return;
 
-          // Feed Twilio audio into the local pipeline
           callSession.processMedia(payload);
           break;
 
@@ -229,67 +216,9 @@ wss.on("connection", (twilioWs: WebSocket) => {
   });
 });
 
-// ═══════════════════════════════════════════════════════
-// ✅ OLD ElevenLabs WebSocket handler (preserved for reference)
-//    Uncomment and use connectToElevenLabs if switching back
-// ═══════════════════════════════════════════════════════
 
-/*
-function setupElevenLabs(
-  elevenLabsWs: WebSocket,
-  twilioWs: WebSocket,
-  streamSid: string,
-  onReady: () => void,
-) {
-  elevenLabsWs.on("message", (data: string) => {
-    try {
-      const message = JSON.parse(data);
 
-      switch (message.type) {
-        case "audio":
-          if (message.audio_event?.audio_base_64) {
-            twilioWs.send(
-              JSON.stringify({
-                event: "media",
-                streamSid,
-                media: {
-                  payload: message.audio_event.audio_base_64,
-                },
-              }),
-            );
-          }
-          break;
 
-        case "user_transcript":
-          console.log(
-            "👤 User:",
-            message.user_transcription_event?.user_transcript,
-          );
-          break;
-
-        case "agent_response":
-          console.log("🤖 AI:", message.agent_response_event?.agent_response);
-          break;
-
-        case "conversation_initiation_metadata":
-          console.log("✅ ElevenLabs ready");
-          onReady();
-          break;
-
-        case "error":
-          console.error("❌ ElevenLabs error:", message);
-          break;
-      }
-    } catch (err) {
-      console.error("❌ ElevenLabs parse error:", err);
-    }
-  });
-}
-*/
-
-// ═══════════════════════════════════════════════════════
-// ✅ Outbound call trigger
-// ═══════════════════════════════════════════════════════
 
 async function makeCall(to: string) {
   const call = await twilioClient.calls.create({
@@ -312,12 +241,10 @@ app.get("/make-call", async (_, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════
-// ✅ Server startup with preflight checks
-// ═══════════════════════════════════════════════════════
+
 
 server.listen(PORT, () => {
-  // Check Piper TTS is available
+
   const piperReady = checkPiperReady();
 
   console.log(`

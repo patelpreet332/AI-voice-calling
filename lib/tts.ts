@@ -1,8 +1,7 @@
 import axios from "axios";
 
-/**
- * Piper TTS — Now supports language switching
- */
+
+
 
 const PYTHON_TTS_API_URL = "http://localhost:8000/tts";
 
@@ -26,9 +25,8 @@ export async function synthesize(text: string, language: string = "en"): Promise
   }
 }
 
-/**
- * Check if Piper TTS is ready
- */
+
+
 export function checkPiperReady(): boolean {
   return true;
 }

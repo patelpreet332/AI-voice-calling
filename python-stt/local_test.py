@@ -8,7 +8,7 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ================= CONFIG =================
+
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -40,13 +40,13 @@ If unclear, ask short clarification.
 Never say you are an AI.
 """
 
-# ================= LOGGING =================
+
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("VOICE")
 
-# ================= GLOBAL =================
+
 
 audio_queue = queue.Queue()
 text_queue = queue.Queue()
@@ -61,21 +61,16 @@ whisper_model = None
 indic_model = None
 piper_voices = {}
 
-# ================= LOAD =================
+
 def warmup():
     log.info("[WARMUP] starting")
 
     dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
 
-    # Whisper warmup
     whisper_model.transcribe(dummy)
-
-    # Indic warmup
     if indic_model:
         import torch
         indic_model(torch.zeros(1, SAMPLE_RATE), "hi")
-
-    # TTS warmup
     if "en" in piper_voices:
         for _ in piper_voices["en"].synthesize("hello"):
             break
@@ -115,7 +110,7 @@ def load_models():
             piper_voices[lang] = PiperVoice.load(str(path))
             log.info(f"[TTS] Loaded {lang}")
 
-# ================= VAD =================
+
 
 vad = webrtcvad.Vad(VAD_MODE)
 
@@ -175,14 +170,14 @@ def mic_worker():
 
         audio_queue.put(audio)
 
-# ================= STT =================
+
 
 def stt_worker():
     while True:
         audio = audio_queue.get()
         start = time.time()
 
-        # ================= FORCE MODE =================
+
         if FORCE_LANG:
             lang = FORCE_LANG
 
@@ -204,7 +199,7 @@ def stt_worker():
                 text = "".join(s.text for s in segments)
                 engine = "whisper"
 
-        # ================= AUTO MODE =================
+
         else:
             segments, info = whisper_model.transcribe(
                 audio,
@@ -235,7 +230,7 @@ def stt_worker():
         log.info(f"[USER] ({engine}/{lang}) {time.time()-start:.2f}s → {text}")
         text_queue.put((text, lang))
 
-# ================= LLM =================
+
 
 def llm_worker():
     while True:
@@ -284,8 +279,6 @@ def llm_worker():
 
                     buffer += token
                     full += token
-
-                    # STREAM TO TTS
                     if len(buffer) > 60 or buffer.endswith((".", "?", "!")):
                         reply_queue.put((buffer, lang, False))
                         buffer = ""
@@ -301,7 +294,7 @@ def llm_worker():
         with conversation_lock:
             conversation.append({"role": "assistant", "content": full})
 
-# ================= TTS =================
+
 
 def tts_worker():
     stream = sd.OutputStream(samplerate=22050, channels=1, dtype='int16')
@@ -316,7 +309,6 @@ def tts_worker():
         current_lang = lang
         buffer += text
 
-        # SMART FLUSH CONDITIONS
         should_flush = (
             len(buffer) > 80 or
             buffer.endswith((".", "?", "!")) or
@@ -339,7 +331,7 @@ def tts_worker():
 
         buffer = ""
 
-# ================= MAIN =================
+
 
 def main():
     global FORCE_LANG

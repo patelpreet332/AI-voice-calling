@@ -1,4 +1,4 @@
-# AI Voice Agent (Phone + Local)
+# AI Voice Calling Agent (Phone + Local)
 
 Two ways to run this project:
 

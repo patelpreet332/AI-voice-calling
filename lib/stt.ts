@@ -2,16 +2,7 @@ import axios from "axios";
 import FormData from "form-data";
 import { createWavBuffer } from "./audio-utils.js";
 
-/**
- * Speech-to-Text client using Hybrid Pipeline (Python FastAPI)
- *
- * Pipeline:
- *   1. Whisper medium → language detection
- *   2. English → Whisper medium
- *   3. Indian language → IndicConformer-600M
- *
- * Sends PCM audio to the Python STT service running on localhost:8000
- */
+
 
 const STT_URL = process.env.STT_URL || "http://localhost:8000";
 
@@ -26,18 +17,16 @@ export interface STTResult {
 }
 
 export interface TranscribeOptions {
-  /** Hint from previous turns to stabilize language detection on short phone utterances */
+
   hintLanguage?: string;
 }
 
-/**
- * Transcribe PCM 16kHz audio buffer using the hybrid STT pipeline
- */
+
 export async function transcribe(
   pcmBuffer: Buffer,
   opts: TranscribeOptions = {},
 ): Promise<STTResult> {
-  // Wrap raw PCM in a WAV container (STT service expects WAV format)
+
   const wavBuffer = createWavBuffer(pcmBuffer, 16000, 1, 16);
 
   const form = new FormData();

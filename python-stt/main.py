@@ -12,23 +12,23 @@ import os
 
 from piper.voice import PiperVoice
 
-# ==================== LOGGING ====================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("HYBRID-STT")
 
 app = FastAPI(title="Dynamic STT + TTS (Whisper + IndicConformer)")
 
-# ==================== CONFIG ====================
+
 SAMPLE_RATE = 16000
 
-# Keep this aligned with python-stt/local_test.py
+
 INDIC_LANGS = {"hi", "gu", "te", "ta"}
 VALID_LANGS = {"en", "hi", "te", "ta", "gu"}
 
-# Optional server-side override (mirrors local_test.py FORCE_LANG behavior)
+
 FORCE_LANG = (os.getenv("STT_FORCE_LANG") or "").strip() or None
 
-# ==================== MODELS ====================
+
 
 logger.info("🧠 Loading Whisper...")
 whisper = WhisperModel("small", device="cpu", compute_type="int8")
@@ -51,7 +51,7 @@ def load_indic():
 
 load_indic()
 
-# ==================== TTS ====================
+
 
 PIPER_MODELS = {}
 
@@ -95,7 +95,7 @@ async def tts(req: TTSRequest):
     return StreamingResponse(stream(), media_type="audio/pcm")
 
 
-# ==================== STT CORE ====================
+
 
 def _resample_to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
     if sr == SAMPLE_RATE:
@@ -124,7 +124,7 @@ def transcribe_whisper(audio: np.ndarray, lang: str | None = None, detect: bool 
 
     detected_lang = (info.language or lang or "en").strip().lower()[:2]
     prob = float(getattr(info, "language_probability", 0.0) or 0.0)
-    # Use segment logprobs as a weak score for language disambiguation.
+
     avg_logprob = None
     try:
         if segs:
@@ -169,7 +169,7 @@ def transcribe_indic(audio, lang):
         return transcribe_whisper(audio, lang=lang, detect=False)
 
 
-# ==================== STT API ====================
+
 
 @app.post("/transcribe")
 async def transcribe(
@@ -181,7 +181,7 @@ async def transcribe(
         audio_bytes = await file.read()
         audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
 
-        # Convert to mono
+
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
 
@@ -190,7 +190,7 @@ async def transcribe(
 
         hint = (hint_language or "").strip().lower()[:2] or None
 
-        # ================= FORCE MODE (mirrors local_test.py) =================
+
         if FORCE_LANG:
             lang = FORCE_LANG.strip().lower()[:2]
 
@@ -218,9 +218,6 @@ async def transcribe(
                 "duration": round(float(duration_sec), 3),
             }
 
-        # ================= AUTO MODE (mirrors local_test.py) =================
-        # Auto-detect (natural behavior). We keep the hint only as a *tie-breaker*
-        # in rare cases of very low-confidence detection.
         out = transcribe_whisper(audio, lang=None, detect=True)
         detect_time = out["time"]
         detected = (out["language"] or "en").strip().lower()[:2]
@@ -230,10 +227,6 @@ async def transcribe(
             logger.info(f"🧷 [HINT] Very low detect confidence ({conf:.2f}) → using hint={hint}")
             detected = hint
 
-        # Gujarati vs Hindi confusion happens a lot on 8kHz phone audio.
-        # If Whisper says "hi" with only medium confidence, do a cheap A/B
-        # transcription for "hi" vs "gu" and pick the better logprob.
-        # Extend range: even higher-confidence "hi" can still actually be Gujarati on phone audio.
         if detected == "hi" and 0.25 <= conf <= 0.90:
             try:
                 hi_out = transcribe_whisper(audio, lang="hi", detect=False)
@@ -242,7 +235,6 @@ async def transcribe(
                 gu_lp = gu_out.get("avg_logprob")
                 if hi_lp is not None and gu_lp is not None:
                     logger.info(f"🔎 [HIvsGU] hi_lp={hi_lp:.3f} gu_lp={gu_lp:.3f}")
-                    # Smaller margin to switch, because Gujarati often appears as Hindi in script.
                     if gu_lp > hi_lp + 0.05:
                         detected = "gu"
                         out = gu_out
@@ -250,11 +242,6 @@ async def transcribe(
             except Exception as e:
                 logger.warning(f"🔎 [HIvsGU] Disambiguation failed: {e}")
 
-        # English being detected as Telugu can happen on phone calls, especially when
-        # the speech is Indian-accented and Whisper language ID is uncertain.
-        # If we detected Telugu with less-than-high confidence, do an A/B check
-        # between forced 'te' and forced 'en' Whisper passes and pick the better logprob.
-        # Limit to short/medium utterances so we don't add too much latency on long audio.
         if detected == "te" and conf <= 0.80 and duration_sec <= 6.5:
             try:
                 te_out = transcribe_whisper(audio, lang="te", detect=False)
@@ -305,7 +292,7 @@ async def transcribe(
         raise HTTPException(500, str(e))
 
 
-# ==================== HEALTH ====================
+
 
 @app.get("/health")
 async def health():
@@ -319,7 +306,7 @@ async def health():
     }
 
 
-# ==================== RUN ====================
+
 
 if __name__ == "__main__":
     import uvicorn
