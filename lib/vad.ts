@@ -20,10 +20,12 @@ export interface VADConfig {
 }
 
 const DEFAULT_CONFIG: VADConfig = {
-  speechThreshold: 300,           // slightly higher
-  silenceDurationMs: 900,        // increased (was 1200)
-  minSpeechDurationMs: 450,       // increased
-  maxSpeechDurationMs: 10000,
+  // Tuned to mirror python-stt/local_test.py behavior (MIN_SPEECH_SEC/SILENCE_SEC/MAX_AUDIO_SEC)
+  // Note: Twilio phone audio benefits from slightly shorter end-of-utterance silence.
+  speechThreshold: 300,
+  silenceDurationMs: 650,
+  minSpeechDurationMs: 650,
+  maxSpeechDurationMs: 20000,
   sampleRate: 16000,
 };
 
@@ -38,6 +40,8 @@ export class VAD {
 
   // Track if we're currently processing (to avoid overlapping STT calls)
   private isProcessing: boolean = false;
+  // When an utterance ends while we're processing, keep the latest one instead of dropping it.
+  private pendingUtterance: Buffer | null = null;
 
   constructor(config: Partial<VADConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -56,6 +60,11 @@ export class VAD {
    */
   setProcessing(state: boolean): void {
     this.isProcessing = state;
+    if (!state && this.pendingUtterance && this.onSpeechEnd) {
+      const audio = this.pendingUtterance;
+      this.pendingUtterance = null;
+      this.onSpeechEnd(audio);
+    }
   }
 
   /**
@@ -132,6 +141,8 @@ export class VAD {
       console.log(
         "⏳ [VAD] Still processing previous utterance, skipping...",
       );
+      // Do not drop the user's speech entirely; keep the latest completed utterance.
+      this.pendingUtterance = Buffer.concat(this.audioBuffer);
       this.resetBuffer();
       return;
     }

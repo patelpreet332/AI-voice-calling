@@ -10,8 +10,17 @@ const TWILIO_CHUNK_SIZE = 160;
 /** Piper TTS output sample rate */
 const PIPER_SAMPLE_RATE = 22050;
 
-/** Greeting message */
-const GREETING_TEXT = "Hello! Pikachu here, Thanks for taking the call. How can I help you today?";
+/** Optional greeting message (empty by default for lowest latency) */
+const GREETING_TEXT = (process.env.GREETING_TEXT || "").trim();
+// Don't bias language detection at call start. We only start hinting after we have
+// at least one detected language from the STT service.
+const DEFAULT_HINT_LANG = (process.env.DEFAULT_LANG || "").trim().toLowerCase().slice(0, 2);
+
+function envInt(name: string, fallback: number): number {
+  const raw = (process.env[name] || "").trim();
+  const val = Number.parseInt(raw, 10);
+  return Number.isFinite(val) ? val : fallback;
+}
 
 export class CallSession {
   private streamSid: string;
@@ -23,17 +32,20 @@ export class CallSession {
   private stopCurrentAudio: boolean = false;
   private callSid: string | null = null;
   private lastAiSpeechEndTime: number = 0;
+  private lastDetectedLanguage: string = DEFAULT_HINT_LANG;
+  private utteranceSeq: number = 0;
 
   constructor(streamSid: string, twilioWs: WebSocket) {
     this.streamSid = streamSid;
     this.twilioWs = twilioWs;
 
-    // Improved VAD settings
+    // VAD tuned to mirror python-stt/local_test.py semantics
     this.vad = new VAD({
-  speechThreshold: 300,           // slightly higher
-  silenceDurationMs: 900,        // increased (was 1200)
-  minSpeechDurationMs: 450,       // increased
-  maxSpeechDurationMs: 10000,
+      // Allow per-deploy tuning for Twilio phone audio without code changes.
+      speechThreshold: envInt("VAD_THRESHOLD", 300),
+      silenceDurationMs: envInt("VAD_SILENCE_MS", 650),
+      minSpeechDurationMs: envInt("VAD_MIN_SPEECH_MS", 650),
+      maxSpeechDurationMs: envInt("VAD_MAX_SPEECH_MS", 20000),
     });
 
     this.llm = new LLMSession();
@@ -43,7 +55,9 @@ export class CallSession {
     });
 
     console.log(`🎯 [SESSION] Created for stream: ${streamSid}`);
-    setTimeout(() => this.sendGreeting(), 600);
+    if (GREETING_TEXT.length > 0) {
+      setTimeout(() => this.sendGreeting(), 600);
+    }
   }
 
   setCallSid(callSid: string): void {
@@ -119,12 +133,20 @@ export class CallSession {
     if (!this.isActive) return;
 
     this.vad.setProcessing(true);
+    const mySeq = ++this.utteranceSeq;
 
     try {
       const startTime = Date.now();
 
       console.log("📝 [STT] Transcribing...");
-      const sttResult = await transcribe(pcmAudio);
+      const sttResult = await transcribe(pcmAudio, {
+        hintLanguage: this.lastDetectedLanguage || undefined,
+      });
+
+      // Call might have ended while STT was running.
+      if (!this.isActive || mySeq !== this.utteranceSeq) {
+        return;
+      }
 
       if (!sttResult.text || sttResult.text.trim() === "") {
         console.log("⚠️  [STT] Empty transcription, skipping");
@@ -133,6 +155,9 @@ export class CallSession {
       }
 
       console.log(`👤 [USER] "${sttResult.text}" (${sttResult.language} | engine: ${sttResult.engine || 'unknown'} | detect: ${sttResult.detect_time || 0}s | total: ${sttResult.pipeline_time || 0}s)`);
+      if (sttResult.language) {
+        this.lastDetectedLanguage = sttResult.language.toLowerCase().slice(0, 2);
+      }
 
       // === INTERRUPTION COMMANDS ===
       const lower = sttResult.text.toLowerCase().trim();
@@ -143,29 +168,59 @@ export class CallSession {
         return;
       }
 
-      // === LLM + TTS ===
+      // === LLM + TTS (streaming buffer similar to local_test.py) ===
       console.log("🤖 [LLM] Thinking...");
       const llmStart = Date.now();
-      let isFirstSentence = true;
+      let firstChunkLogged = false;
 
-      for await (const sentence of this.llm.chatStream(sttResult.text, sttResult.language)) {
-        if (!this.isActive || this.stopCurrentAudio) {
-          break;
+      let ttsBuffer = "";
+      const shouldFlush = (text: string, isFinal: boolean) => {
+        const trimmed = text.trim();
+        if (trimmed.length === 0) return false;
+        return (
+          trimmed.length >= 80 ||
+          /[.?!।]$/.test(trimmed) ||
+          isFinal
+        );
+      };
+
+      for await (const chunk of this.llm.chatStream(sttResult.text, sttResult.language)) {
+        if (!this.isActive || this.stopCurrentAudio || mySeq !== this.utteranceSeq) break;
+        if (!chunk) continue;
+
+        if (!firstChunkLogged) {
+          console.log(`🤖 [AI] first_chunk (${Date.now() - llmStart}ms)`);
+          firstChunkLogged = true;
         }
 
-        if (sentence) {
-          if (isFirstSentence) {
-            console.log(`🤖 [AI] First sentence: "${sentence}" (${Date.now() - llmStart}ms)`);
-            isFirstSentence = false;
-          } else {
-            console.log(`🤖 [AI] "${sentence}"`);
-          }
+        ttsBuffer += chunk;
 
+        if (!shouldFlush(ttsBuffer, false)) continue;
+
+        const toSpeak = ttsBuffer.trim();
+        ttsBuffer = "";
+
+        if (!toSpeak) continue;
+        console.log(`🤖 [AI] → "${toSpeak}"`);
+
+        const ttsStart = Date.now();
+        const ttsPcm = await synthesize(toSpeak, sttResult.language);
+        console.log(`🔊 [TTS] Done (${Date.now() - ttsStart}ms)`);
+
+        if (!this.isActive || this.stopCurrentAudio || mySeq !== this.utteranceSeq) break;
+        await this.sendAudioToTwilio(ttsPcm);
+      }
+
+      if (this.isActive && !this.stopCurrentAudio && mySeq === this.utteranceSeq) {
+        const toSpeak = ttsBuffer.trim();
+        if (toSpeak) {
+          console.log(`🤖 [AI] → "${toSpeak}"`);
           const ttsStart = Date.now();
-          const ttsPcm = await synthesize(sentence, sttResult.language);
+          const ttsPcm = await synthesize(toSpeak, sttResult.language);
           console.log(`🔊 [TTS] Done (${Date.now() - ttsStart}ms)`);
-
-          await this.sendAudioToTwilio(ttsPcm);
+          if (this.isActive && !this.stopCurrentAudio && mySeq === this.utteranceSeq) {
+            await this.sendAudioToTwilio(ttsPcm);
+          }
         }
       }
 
@@ -239,6 +294,7 @@ export class CallSession {
 
   destroy(): void {
     this.isActive = false;
+    this.utteranceSeq++;
     this.vad.flush();
     this.vad.reset();
     this.llm.clear();

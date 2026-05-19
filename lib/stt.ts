@@ -25,10 +25,18 @@ export interface STTResult {
   detect_time?: number;
 }
 
+export interface TranscribeOptions {
+  /** Hint from previous turns to stabilize language detection on short phone utterances */
+  hintLanguage?: string;
+}
+
 /**
  * Transcribe PCM 16kHz audio buffer using the hybrid STT pipeline
  */
-export async function transcribe(pcmBuffer: Buffer): Promise<STTResult> {
+export async function transcribe(
+  pcmBuffer: Buffer,
+  opts: TranscribeOptions = {},
+): Promise<STTResult> {
   // Wrap raw PCM in a WAV container (STT service expects WAV format)
   const wavBuffer = createWavBuffer(pcmBuffer, 16000, 1, 16);
 
@@ -38,16 +46,23 @@ export async function transcribe(pcmBuffer: Buffer): Promise<STTResult> {
     contentType: "audio/wav",
   });
 
+  const hint = (opts.hintLanguage || "").trim().toLowerCase().slice(0, 2);
+  if (hint) {
+    form.append("hint_language", hint);
+  }
+
   const response = await axios.post(`${STT_URL}/transcribe`, form, {
     headers: form.getHeaders(),
     timeout: 150000,
   });
 
+  const durationSec = pcmBuffer.length / 2 / 16000;
+
   return {
     text: response.data.text || "",
     language: response.data.language || "en",
     confidence: response.data.confidence || 0,
-    duration: response.data.duration || 0,
+    duration: response.data.duration || durationSec,
     engine: response.data.engine || "unknown",
     pipeline_time: response.data.pipeline_time || 0,
     detect_time: response.data.detect_time || 0,

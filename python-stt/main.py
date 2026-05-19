@@ -1,5 +1,5 @@
 from faster_whisper import WhisperModel
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import soundfile as sf
@@ -19,7 +19,14 @@ logger = logging.getLogger("HYBRID-STT")
 app = FastAPI(title="Dynamic STT + TTS (Whisper + IndicConformer)")
 
 # ==================== CONFIG ====================
-INDIC_LANGS = {"hi", "gu", "te", "ta", "kn", "ml", "pa"}
+SAMPLE_RATE = 16000
+
+# Keep this aligned with python-stt/local_test.py
+INDIC_LANGS = {"hi", "gu", "te", "ta"}
+VALID_LANGS = {"en", "hi", "te", "ta", "gu"}
+
+# Optional server-side override (mirrors local_test.py FORCE_LANG behavior)
+FORCE_LANG = (os.getenv("STT_FORCE_LANG") or "").strip() or None
 
 # ==================== MODELS ====================
 
@@ -60,6 +67,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "piper"
 
 load_piper(os.path.join(BASE_DIR, "en_US-lessac-medium.onnx"), "en")
 load_piper(os.path.join(BASE_DIR, "hi_IN-priyamvada-medium.onnx"), "hi")
+load_piper(os.path.join(BASE_DIR, "te_IN-padmavathi-medium.onnx"), "te")
+load_piper(os.path.join(BASE_DIR, "gu_epoch229.onnx"), "gu")
 
 DEFAULT_TTS = PIPER_MODELS.get("en")
 
@@ -74,7 +83,10 @@ async def tts(req: TTSRequest):
     if not req.text.strip():
         raise HTTPException(400, "Empty text")
 
-    voice = PIPER_MODELS.get(req.language, DEFAULT_TTS)
+    lang = (req.language or "en").strip().lower()[:2]
+    voice = PIPER_MODELS.get(lang) or PIPER_MODELS.get("hi") or DEFAULT_TTS
+    if voice is None:
+        raise HTTPException(500, "No TTS voice loaded")
 
     def stream():
         for chunk in voice.synthesize(req.text):
@@ -85,45 +97,55 @@ async def tts(req: TTSRequest):
 
 # ==================== STT CORE ====================
 
-def detect_language(audio):
-    """
-    Whisper-based language detection
-    """
+def _resample_to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+    if sr == SAMPLE_RATE:
+        return audio
+    try:
+        from scipy.signal import resample_poly
+        g = np.gcd(sr, SAMPLE_RATE)
+        up = SAMPLE_RATE // g
+        down = sr // g
+        return resample_poly(audio, up, down).astype(np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Unsupported sample rate {sr}; install scipy for resampling. ({e})")
+
+
+def transcribe_whisper(audio: np.ndarray, lang: str | None = None, detect: bool = False):
+    start = time.time()
     segments, info = whisper.transcribe(
         audio,
-        language=None,
+        language=lang if not detect else None,
         beam_size=1,
-        best_of=1
+        temperature=0.0
     )
+    segs = list(segments)
+    text = "".join([s.text for s in segs]).strip()
+    took = time.time() - start
 
-    # trigger detection
-    for _ in segments:
-        break
-
-    lang = info.language or "en"
-    prob = float(info.language_probability)
-
-    logger.info(f"🌐 [WHISPER DETECT] → {lang} ({prob:.2%})")
-
-    return lang, prob
-
-
-def transcribe_whisper(audio, lang=None):
-    segments, info = whisper.transcribe(audio, language=lang)
-
-    text = " ".join([s.text.strip() for s in segments]).strip()
+    detected_lang = (info.language or lang or "en").strip().lower()[:2]
+    prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+    # Use segment logprobs as a weak score for language disambiguation.
+    avg_logprob = None
+    try:
+        if segs:
+            avg_logprob = float(sum(getattr(s, "avg_logprob", 0.0) for s in segs) / len(segs))
+    except Exception:
+        avg_logprob = None
 
     return {
         "text": text,
-        "language": info.language or lang or "en",
-        "engine": "whisper"
+        "language": detected_lang,
+        "confidence": prob,
+        "avg_logprob": avg_logprob,
+        "time": took,
+        "engine": "whisper",
     }
 
 
 def transcribe_indic(audio, lang):
     if indic_model is None:
         logger.warning("⚠️ IndicConformer unavailable → fallback to Whisper")
-        return transcribe_whisper(audio, lang)
+        return transcribe_whisper(audio, lang=lang, detect=False)
 
     try:
         if isinstance(audio, np.ndarray):
@@ -144,14 +166,18 @@ def transcribe_indic(audio, lang):
 
     except Exception as e:
         logger.error(f"❌ IndicConformer failed: {e}")
-        return transcribe_whisper(audio, lang)
+        return transcribe_whisper(audio, lang=lang, detect=False)
 
 
 # ==================== STT API ====================
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile):
+async def transcribe(
+    file: UploadFile,
+    hint_language: str | None = Form(default=None),
+):
     try:
+        overall_start = time.time()
         audio_bytes = await file.read()
         audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
 
@@ -159,28 +185,120 @@ async def transcribe(file: UploadFile):
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
 
-        start = time.time()
+        audio = _resample_to_16k(audio, sr)
+        duration_sec = float(len(audio) / SAMPLE_RATE) if len(audio) else 0.0
 
-        # STEP 1: Detect language
-        lang, prob = detect_language(audio)
+        hint = (hint_language or "").strip().lower()[:2] or None
 
-        # STEP 2: Route
-        if lang in INDIC_LANGS:
-            logger.info(f"🇮🇳 [ROUTE] Indic → {lang}")
-            result = transcribe_indic(audio, lang)
+        # ================= FORCE MODE (mirrors local_test.py) =================
+        if FORCE_LANG:
+            lang = FORCE_LANG.strip().lower()[:2]
+
+            if lang in INDIC_LANGS:
+                logger.info(f"🇮🇳 [FORCE] Indic → {lang}")
+                detect_time = 0.0
+                result = transcribe_indic(audio, lang)
+                confidence = 0.0
+            else:
+                logger.info(f"🇬🇧 [FORCE] Whisper → {lang}")
+                out = transcribe_whisper(audio, lang=lang, detect=False)
+                detect_time = 0.0
+                result = {"text": out["text"], "language": lang, "engine": "whisper"}
+                confidence = out["confidence"]
+
+            pipeline_time = time.time() - overall_start
+            return {
+                "text": (result.get("text") or "").strip(),
+                "language": lang,
+                "engine": result.get("engine", "whisper"),
+                "detected_language": lang,
+                "confidence": round(float(confidence), 3),
+                "detect_time": round(float(detect_time), 3),
+                "pipeline_time": round(float(pipeline_time), 3),
+                "duration": round(float(duration_sec), 3),
+            }
+
+        # ================= AUTO MODE (mirrors local_test.py) =================
+        # Auto-detect (natural behavior). We keep the hint only as a *tie-breaker*
+        # in rare cases of very low-confidence detection.
+        out = transcribe_whisper(audio, lang=None, detect=True)
+        detect_time = out["time"]
+        detected = (out["language"] or "en").strip().lower()[:2]
+
+        conf = float(out.get("confidence", 0.0) or 0.0)
+        if hint and hint in VALID_LANGS and conf < 0.35:
+            logger.info(f"🧷 [HINT] Very low detect confidence ({conf:.2f}) → using hint={hint}")
+            detected = hint
+
+        # Gujarati vs Hindi confusion happens a lot on 8kHz phone audio.
+        # If Whisper says "hi" with only medium confidence, do a cheap A/B
+        # transcription for "hi" vs "gu" and pick the better logprob.
+        # Extend range: even higher-confidence "hi" can still actually be Gujarati on phone audio.
+        if detected == "hi" and 0.25 <= conf <= 0.90:
+            try:
+                hi_out = transcribe_whisper(audio, lang="hi", detect=False)
+                gu_out = transcribe_whisper(audio, lang="gu", detect=False)
+                hi_lp = hi_out.get("avg_logprob")
+                gu_lp = gu_out.get("avg_logprob")
+                if hi_lp is not None and gu_lp is not None:
+                    logger.info(f"🔎 [HIvsGU] hi_lp={hi_lp:.3f} gu_lp={gu_lp:.3f}")
+                    # Smaller margin to switch, because Gujarati often appears as Hindi in script.
+                    if gu_lp > hi_lp + 0.05:
+                        detected = "gu"
+                        out = gu_out
+                        logger.info("🔎 [HIvsGU] Switching detected language → gu")
+            except Exception as e:
+                logger.warning(f"🔎 [HIvsGU] Disambiguation failed: {e}")
+
+        # English being detected as Telugu can happen on phone calls, especially when
+        # the speech is Indian-accented and Whisper language ID is uncertain.
+        # If we detected Telugu with less-than-high confidence, do an A/B check
+        # between forced 'te' and forced 'en' Whisper passes and pick the better logprob.
+        # Limit to short/medium utterances so we don't add too much latency on long audio.
+        if detected == "te" and conf <= 0.80 and duration_sec <= 6.5:
+            try:
+                te_out = transcribe_whisper(audio, lang="te", detect=False)
+                en_out = transcribe_whisper(audio, lang="en", detect=False)
+                te_lp = te_out.get("avg_logprob")
+                en_lp = en_out.get("avg_logprob")
+                if te_lp is not None and en_lp is not None:
+                    logger.info(f"🔎 [TEvsEN] te_lp={te_lp:.3f} en_lp={en_lp:.3f}")
+                    if en_lp > te_lp + 0.10:
+                        detected = "en"
+                        out = en_out
+                        logger.info("🔎 [TEvsEN] Switching detected language → en")
+            except Exception as e:
+                logger.warning(f"🔎 [TEvsEN] Disambiguation failed: {e}")
+
+        if detected not in VALID_LANGS:
+            detected = "hi"
+
+        if detected in INDIC_LANGS:
+            logger.info(f"🇮🇳 [ROUTE] Indic → {detected}")
+            result = transcribe_indic(audio, detected)
+            text = (result.get("text") or "").strip()
+            engine = result.get("engine", "indic-conformer")
         else:
-            logger.info(f"🇬🇧 [ROUTE] Whisper → {lang}")
-            result = transcribe_whisper(audio, lang)
+            logger.info(f"🇬🇧 [ROUTE] Whisper → {detected}")
+            text = (out.get("text") or "").strip()
+            engine = "whisper"
 
-        result["detected_language"] = lang
-        result["confidence"] = round(prob, 3)
-        result["time"] = round(time.time() - start, 2)
+        pipeline_time = time.time() - overall_start
 
         logger.info(
-            f"📊 Done | Lang={lang} | Engine={result['engine']} | Time={result['time']}s"
+            f"📊 Done | Lang={detected} | Engine={engine} | detect={detect_time:.2f}s total={pipeline_time:.2f}s"
         )
 
-        return result
+        return {
+            "text": text,
+            "language": detected,
+            "engine": engine,
+            "detected_language": detected,
+            "confidence": round(float(out.get("confidence", 0.0) or 0.0), 3),
+            "detect_time": round(float(detect_time), 3),
+            "pipeline_time": round(float(pipeline_time), 3),
+            "duration": round(float(duration_sec), 3),
+        }
 
     except Exception as e:
         logger.error(f"❌ Transcription error: {e}")

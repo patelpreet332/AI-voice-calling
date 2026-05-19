@@ -5,27 +5,15 @@ interface ChatMessage {
   content: string;
 }
 
-const SYSTEM_PROMPT = `You are a friendly, natural Indian voice assistant in a real-time phone call.
-
-Core rules:
-- Speak exactly like a helpful human friend — warm, casual, never robotic.
-- Keep every reply to 1-2 short sentences max. Be crisp.
-- Use natural fillers: "Haan", "Theek hai", "Achha", "Okay" etc.
-- Vary your phrasing naturally.
-
-Language rules:
-- Always reply in the same language (or mix) the user is using right now.
-- For Hindi/Marathi: Use proper Devanagari.
-- For Gujarati, Tamil, Telugu etc.: Write phonetically in Devanagari so the Hindi voice can pronounce it naturally (e.g., "Tamne Gujarati ma baat karvi che?").
-- Handle Hinglish/code-mixing perfectly — it's normal.
-
-STT is sometimes imperfect — understand intent, not exact words.
-If unclear, ask one short clarification question.
-
-Never be verbose. Never use lists or markdown.
-If user says stop/bas/chup/enough — politely stop and confirm.
-
-Tone: Friendly, calm, helpful, slightly playful.`;
+// Keep aligned with python-stt/local_test.py
+const SYSTEM_PROMPT = `You are a real-time  voice assistant speaking over a phone call.
+Keep replies natural, human-like and brief.
+Keep your response short and to the point, like a helpful friend on a call but should include all user answer.
+Always reply in same language as user.
+Use casual spoken tone.
+If unclear, ask short clarification.
+Dont ever point yourself with name.
+`;
 
 export class LLMSession {
   private history: ChatMessage[] = [];
@@ -36,31 +24,37 @@ export class LLMSession {
   }
 
   /**
-   * Streaming response with language awareness
+   * Streaming response similar to python-stt/local_test.py:
+   * flush chunks when buffer grows or punctuation ends.
    */
-  async *chatStream(userMessage: string, detectedLanguage: string = "en"): AsyncGenerator<string, void, unknown> {
-    this.history.push({ role: "user", content: userMessage });
-
-    if (this.history.length > 21) {
-      const system = this.history[0];
-      this.history = [system, ...this.history.slice(-20)];
-    }
-
-    // Embed invisible per-turn language directive to guarantee flawless multilingual behavior
-    const apiMessages = [...this.history];
-    const lastIdx = apiMessages.length - 1;
-    apiMessages[lastIdx] = {
+  async *chatStream(
+    userMessage: string,
+    detectedLanguage: string = "en",
+  ): AsyncGenerator<string, void, unknown> {
+    const lang = (detectedLanguage || "en").toLowerCase().slice(0, 2);
+    this.history.push({
       role: "user",
-      content: `${userMessage}\n\n[System directive: Respond in language '${detectedLanguage}'. If this is an Indian regional language (e.g. gu, te, ta, kn, ml, bn, pa), you MUST output the response written entirely in the Devanagari script so the TTS engine can speak it.]`
-    };
+      // Strong per-turn constraint to prevent drifting into Hindi/English.
+      content:
+        `${userMessage}\n\n` +
+        `[Reply ONLY in language code '${lang}'. Keep it short, spoken, natural. ` +
+        `Do NOT translate to another language.`
+    });
+
+    // Mirror local_test.py: keep last ~10 turns for speed/latency.
+    if (this.history.length > 11) {
+      const system = this.history[0];
+      this.history = [system, ...this.history.slice(-10)];
+    }
 
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
         model: this.model,
-        messages: apiMessages,
-        temperature: 0.75,
-        max_tokens: 280,
+        messages: this.history,
+        // Lower temperature improves instruction-following and language adherence.
+        temperature: 0.35,
+        max_tokens: 150,
         stream: true,
       },
       {
@@ -74,7 +68,7 @@ export class LLMSession {
     );
 
     let fullReply = "";
-    let sentenceBuffer = "";
+    let buffer = "";
     const sentenceEndRegex = /[.?!।]\s*$/;
 
     for await (const chunk of response.data) {
@@ -88,11 +82,12 @@ export class LLMSession {
             if (data.choices[0].delta?.content) {
               const text = data.choices[0].delta.content;
               fullReply += text;
-              sentenceBuffer += text;
+              buffer += text;
 
-              if (sentenceEndRegex.test(sentenceBuffer)) {
-                yield sentenceBuffer.trim();
-                sentenceBuffer = "";
+              // Low latency: yield as soon as we have enough characters or punctuation.
+              if (buffer.length >= 60 || sentenceEndRegex.test(buffer)) {
+                yield buffer;
+                buffer = "";
               }
             }
           } catch (e) {
@@ -102,8 +97,8 @@ export class LLMSession {
       }
     }
 
-    if (sentenceBuffer.trim().length > 0) {
-      yield sentenceBuffer.trim();
+    if (buffer.length > 0) {
+      yield buffer;
     }
 
     this.history.push({ role: "assistant", content: fullReply });
