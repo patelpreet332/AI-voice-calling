@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
-    "target": "ES2022",           // Updated from ES2017 (recommended)
+    "target": "ES2022",
     "lib": ["esnext"],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
     "noEmit": false,
     "esModuleInterop": true,
-    "module": "NodeNext",         // ← Best modern choice
-    "moduleResolution": "NodeNext", // ← This fixes the deprecation
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "incremental": true,
